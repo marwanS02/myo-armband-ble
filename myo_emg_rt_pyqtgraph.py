@@ -33,7 +33,7 @@ from PyQt5 import QtWidgets
 import pyqtgraph as pg
 
 # ---------- CONFIG ----------
-PORT = "/dev/ttyUSB0"     # Linux: /dev/ttyACM0 or /dev/ttyUSB0; Windows: "COM5"; macOS: "/dev/tty.usbmodem*"
+PORT = "COM5"     # Linux: /dev/ttyACM0 or /dev/ttyUSB0; Windows: "COM5"; macOS: "/dev/tty.usbmodem*"
 BAUD = 115200
 WINDOW_SEC = 5.0          # visible window
 FS_AGG = 200.0            # aggregate sample rate per channel after merging (Hz)

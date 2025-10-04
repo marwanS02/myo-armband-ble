@@ -138,6 +138,16 @@ void connect_cb(uint16_t handle) {
   conn_handle = handle;
   Serial.println(F("Connected. Discovering Myo services..."));
 
+  // Immediately request better connection parameters
+  ble_gap_conn_params_t params;
+  params.min_conn_interval = 9;    // 11.25 ms
+  params.max_conn_interval = 16;   // 20 ms
+  params.slave_latency     = 0;
+  params.conn_sup_timeout  = 600;  // 6 s
+  Bluefruit.Connection(handle)->requestConnectionParameter(12, 0, 600);
+  Bluefruit.Connection(handle)->requestDataLengthUpdate();
+  Bluefruit.Connection(handle)->requestMtuExchange(247);
+
   // Control service + Command characteristic
   if (!svcControl.discover(handle)) { Serial.println(F("No Control svc.")); Bluefruit.disconnect(handle); return; }
   if (!chrCommand.discover())       { Serial.println(F("No Command chr.")); Bluefruit.disconnect(handle); return; }
@@ -204,4 +214,10 @@ void setup() {
   Serial.println(F("Scanning for Myo..."));
 }
 
-void loop() { }
+unsigned long last_keepalive = 0;
+void loop() {   
+  if (millis() - last_keepalive > 10000 && conn_handle != BLE_CONN_HANDLE_INVALID) {
+    sleep_mode_never();
+    last_keepalive = millis();
+  }
+} 
