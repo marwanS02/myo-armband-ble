@@ -2,33 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-EMG Experiment Runner — Myo BLE→UART
-------------------------------------
-Author: Mohamad Marwan Sidani
+EMG Experiment Runner — Myo BLE→UART (with per-class good-seconds meters)
+---------------------------------------------------------------------------
+Adds live indicators showing how much *clean* (non-failed, non-noisy) time
+has been recorded for each class.
 
-What this does
-==============
-- Connects to your existing BLE→UART gateway (e-lines).
-- Shows 8 real-time EMG plots (2×4 grid).
-- Guides a participant through timed movement cues with colors:
-  * RED   = REST
-  * ORANGE= GET READY (3 s, also shows "Next: …")
-  * GREEN = DO MOVEMENT (randomized duration)
-- Keeps classes balanced by always scheduling from the least-observed classes.
-- Lets you Pause/Resume at any time. On Resume, it **aborts** any in-flight cue,
-  resets to REST, and schedules a fresh cue.
-- Auto-pauses if the serial stream stalls (no new samples for NO_DATA_TIMEOUT).
-- During pause, you can mark the last trial as "FAILED" or "NOISY".
-- Saves two semicolon-separated CSVs:
-    1) samples.csv: per-sample timestamp + 8 EMG + active_label (0..8) + state
-    2) events.csv : timestamped markers (START/END movement, GET_READY, PAUSE, RESUME, FAIL, NOISY, AUTOPAUSE)
-- Automatically creates a session folder:
-    emg_sessions/<ParticipantName>/<YYYYmmdd_HHMMSS>/
-- Media panel (image/GIF) updates per movement. Put files in ./media/
-  Named like: 1_mild_extension.png, 2_full_extension.gif, etc.
+Counting rules
+--------------
+• A trial contributes its DO duration ONLY when it finishes (MOVE_END).
+• Aborted trials (MOVE_ABORT, AUTOPAUSE) contribute 0.
+• If user later marks "FAILED" or "NOISY" while paused, the **last clean trial**
+  is re-labeled and its previously counted seconds are removed from the meters.
+
+Saved files (UTF-8, semicolon):
+• samples.csv : per-sample rows, unchanged
+• events.csv  : markers, unchanged
 """
 
-import os, sys, time, csv, json, glob, queue, threading, random, math
+import os, sys, time, csv, json, glob, queue, threading, random
 from dataclasses import dataclass, field
 from collections import deque, defaultdict
 
@@ -38,8 +29,8 @@ import serial
 from PyQt5 import QtCore, QtWidgets, QtGui
 import pyqtgraph as pg
 
-# -------- USER CONFIG (edit to taste) --------
-PORT = "COM5"     # Linux: /dev/ttyACM0 or /dev/ttyUSB0; Win: "COM5"; macOS: "/dev/tty.usbmodem*"
+# -------- USER CONFIG --------
+PORT = "COM5"     # Linux: /dev/ttyACM0 or /dev/ttyUSB0; Win: "COMx"; macOS: "/dev/tty.usbmodem*"
 BAUD = 115200
 
 N_STREAMS, N_CH = 4, 8
@@ -48,19 +39,15 @@ FS_AGG = 200.0
 BUF_LEN = int(WINDOW_SEC * FS_AGG) * 2
 PRINT_RAW_FIRST_N = 5
 
-# Experiment timing
-READY_LEAD_SEC = 3.0                 # preview time before DO
-REST_RANGE_SEC = (2.0, 4.0)          # randomized rest durations
-MOVE_RANGE_SEC = (2.0, 5.0)          # randomized DO durations
-TARGET_REPS_PER_CLASS = 10           # stop when each class reaches this count (or click Stop)
+READY_LEAD_SEC = 3.0
+REST_RANGE_SEC = (2.0, 4.0)
+MOVE_RANGE_SEC = (2.0, 5.0)
+TARGET_REPS_PER_CLASS = 10
 
-# Auto-pause if no data arrives for this long:
-NO_DATA_TIMEOUT = 0.75               # seconds
+NO_DATA_TIMEOUT = 0.75
 
-# Where to save sessions
 SESSIONS_ROOT = "emg_sessions"
 
-# Label map (0..8)
 LABELS = {
     0: "rest",
     1: "mild_extension",
@@ -73,10 +60,9 @@ LABELS = {
     8: "full_ulnar_flexion",
 }
 
-# Media path pattern per label id (png/gif/jpg supported)
 MEDIA_DIR = "media"
 
-# --------- Serial parsing (same tolerant format) ----------
+# -------- Serial parsing --------
 q = queue.Queue(maxsize=4096)
 raw_streams = [deque() for _ in range(N_STREAMS)]
 last_sample_walltime = 0.0  # for auto-pause
@@ -127,7 +113,7 @@ def serial_reader(stop_event):
             except Exception:
                 pass
 
-# --------- Data writers ----------
+# -------- CSV writers (UTF-8) --------
 @dataclass
 class Writers:
     samples_fp: any = None
@@ -137,11 +123,10 @@ class Writers:
 
     def open(self, session_dir):
         os.makedirs(session_dir, exist_ok=True)
-        self.samples_fp = open(os.path.join(session_dir, "samples.csv"), "w", newline="")
-        self.events_fp  = open(os.path.join(session_dir, "events.csv"),  "w", newline="")
+        self.samples_fp = open(os.path.join(session_dir, "samples.csv"), "w", newline="", encoding="utf-8")
+        self.events_fp  = open(os.path.join(session_dir, "events.csv"),  "w", newline="", encoding="utf-8")
         self.samples_csv = csv.writer(self.samples_fp, delimiter=';')
         self.events_csv  = csv.writer(self.events_fp,  delimiter=';')
-
         self.samples_csv.writerow([
             "timestamp_us","participant","state","active_label_id","active_label_name",
             "stream_index","ch0","ch1","ch2","ch3","ch4","ch5","ch6","ch7"
@@ -154,7 +139,7 @@ class Writers:
         if self.samples_fp: self.samples_fp.close()
         if self.events_fp:  self.events_fp.close()
 
-# --------- Experiment state machine ----------
+# -------- Experiment state machine --------
 class State:
     REST = "REST"
     READY = "READY"
@@ -168,15 +153,19 @@ class Trial:
     t_ready_start: float
     t_do_start: float
     t_do_end: float
-    aborted: bool = False
+
+@dataclass
+class CompletedTrial:
+    label_id: int
+    t_start: float
+    t_end: float
+    status: str = "ok"  # 'ok' | 'failed' | 'noisy'
 
 @dataclass
 class Scheduler:
     per_class_done: dict = field(default_factory=lambda: defaultdict(int))
 
     def pick_next_label(self):
-        # Never schedule "rest" (0) as a *class* to collect; it's the background
-        # Balance over labels 1..8 by choosing from the least-seen group
         counts = {k: self.per_class_done.get(k, 0) for k in range(1, 9)}
         min_seen = min(counts.values())
         candidates = [k for k, v in counts.items() if v == min_seen]
@@ -189,7 +178,7 @@ class Scheduler:
     def all_targets_reached(self, target):
         return all(self.per_class_done.get(k, 0) >= target for k in range(1, 9))
 
-# --------- GUI ----------
+# -------- GUI --------
 class EMGExperiment(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -208,15 +197,11 @@ class EMGExperiment(QtWidgets.QMainWindow):
         l.addRow("Baud:", self.baud_spin)
 
         # Status banner
-        self.banner = QtWidgets.QLabel("IDLE")
-        self.banner.setAlignment(QtCore.Qt.AlignCenter)
-        self.banner.setFixedHeight(40)
-        self._set_banner(State.IDLE)
-        l.addRow(self.banner)
+        self.banner = QtWidgets.QLabel("IDLE"); self.banner.setAlignment(QtCore.Qt.AlignCenter); self.banner.setFixedHeight(40)
+        self._set_banner(State.IDLE); l.addRow(self.banner)
 
         # Next preview
-        self.next_label = QtWidgets.QLabel("Next: —")
-        l.addRow(self.next_label)
+        self.next_label = QtWidgets.QLabel("Next: —"); l.addRow(self.next_label)
 
         # Buttons
         btnbox = QtWidgets.QHBoxLayout()
@@ -224,8 +209,7 @@ class EMGExperiment(QtWidgets.QMainWindow):
         self.btn_pause = QtWidgets.QPushButton("Pause")
         self.btn_resume= QtWidgets.QPushButton("Resume")
         self.btn_stop  = QtWidgets.QPushButton("Stop & Save")
-        btnbox.addWidget(self.btn_start); btnbox.addWidget(self.btn_pause)
-        btnbox.addWidget(self.btn_resume); btnbox.addWidget(self.btn_stop)
+        btnbox.addWidget(self.btn_start); btnbox.addWidget(self.btn_pause); btnbox.addWidget(self.btn_resume); btnbox.addWidget(self.btn_stop)
         l.addRow(btnbox)
 
         # While paused
@@ -235,11 +219,25 @@ class EMGExperiment(QtWidgets.QMainWindow):
         markbox.addWidget(self.btn_fail); markbox.addWidget(self.btn_noisy)
         l.addRow(markbox)
 
+        # Recording meters (per-class good seconds)
+        meters_group = QtWidgets.QGroupBox("Recording meters (good seconds)")
+        meters_layout = QtWidgets.QGridLayout(meters_group)
+        self.class_time_good = defaultdict(float)      # label_id -> seconds
+        self.meter_labels = {}                         # label_id -> QLabel
+        row = 0
+        for k in range(1, 9):
+            name = LABELS[k].replace("_"," ")
+            lab = QtWidgets.QLabel(f"{name}: 0.0 s")
+            self.meter_labels[k] = lab
+            meters_layout.addWidget(lab, row, 0)
+            row += 1
+        self.total_label = QtWidgets.QLabel("Total good time: 0.0 s")
+        meters_layout.addWidget(self.total_label, row, 0)
+        l.addRow(meters_group)
+
         # Media
-        self.media_label = QtWidgets.QLabel()
-        self.media_label.setMinimumSize(280, 180)
-        self.media_label.setFrameShape(QtWidgets.QFrame.Box)
-        self.media_movie = None  # for GIFs
+        self.media_label = QtWidgets.QLabel(); self.media_label.setMinimumSize(280, 180); self.media_label.setFrameShape(QtWidgets.QFrame.Box)
+        self.media_movie = None
         l.addRow("Movement demo:", self.media_label)
 
         # --- Right: plots ---
@@ -270,37 +268,35 @@ class EMGExperiment(QtWidgets.QMainWindow):
 
         # Experiment state
         self.state = State.IDLE
-        self.current_label = 0  # label applied to samples (0=rest)
+        self.current_label = 0
         self.active_trial = None
         self.scheduler = Scheduler()
+
+        # Completed trial history (for retro mark fail/noisy)
+        self.completed_trials = []  # list[CompletedTrial]
 
         # Session files
         self.session_dir = None
         self.writers = Writers()
 
         # timers
-        self.gui_timer = QtCore.QTimer()
-        self.gui_timer.timeout.connect(self.tick)
-        self.gui_timer.start(30)
-
-        self.state_timer = QtCore.QTimer()
-        self.state_timer.setSingleShot(True)
-        self.state_timer.timeout.connect(self._advance_state)
+        self.gui_timer = QtCore.QTimer(); self.gui_timer.timeout.connect(self.tick); self.gui_timer.start(30)
+        self.state_timer = QtCore.QTimer(); self.state_timer.setSingleShot(True); self.state_timer.timeout.connect(self._advance_state)
 
         # buttons
         self.btn_start.clicked.connect(self._on_start)
         self.btn_pause.clicked.connect(self._on_pause)
         self.btn_resume.clicked.connect(self._on_resume)
         self.btn_stop.clicked.connect(self._on_stop)
-        self.btn_fail.clicked.connect(lambda: self._mark_issue("FAILED"))
-        self.btn_noisy.clicked.connect(lambda: self._mark_issue("NOISY"))
+        self.btn_fail.clicked.connect(lambda: self._mark_issue_and_adjust("FAILED"))
+        self.btn_noisy.clicked.connect(lambda: self._mark_issue_and_adjust("NOISY"))
 
         # serial thread
         self.stop_event = threading.Event()
         self.reader_thr = None
 
-        # preview/media init
         self._update_media(0)
+        self._refresh_meters()
 
     # ---------- UI helpers ----------
     def _set_banner(self, state):
@@ -318,7 +314,6 @@ class EMGExperiment(QtWidgets.QMainWindow):
         self.banner.setPalette(pal)
 
     def _update_media(self, label_id):
-        # Try to load image/gif named like "5_mild_radial_flexion.*"
         name = LABELS.get(label_id, "rest")
         pattern = os.path.join(MEDIA_DIR, f"{label_id}_{name}.*")
         files = sorted(glob.glob(pattern))
@@ -343,11 +338,19 @@ class EMGExperiment(QtWidgets.QMainWindow):
                     self.media_label.setText("Media failed to load")
         else:
             self.media_label.setText("(Put media files in ./media)")
-        # Also update the "Next:" preview text
+        # Preview text
         if label_id == 0:
             self.next_label.setText("Next: —")
         else:
             self.next_label.setText(f"Next: {LABELS[label_id].replace('_',' ').title()}")
+
+    def _refresh_meters(self):
+        total = 0.0
+        for k in range(1, 9):
+            sec = float(self.class_time_good.get(k, 0.0))
+            total += sec
+            self.meter_labels[k].setText(f"{LABELS[k].replace('_',' ')}: {sec:.1f} s")
+        self.total_label.setText(f"Total good time: {total:.1f} s")
 
     # ---------- Buttons ----------
     def _on_start(self):
@@ -368,8 +371,8 @@ class EMGExperiment(QtWidgets.QMainWindow):
         self.session_dir = os.path.join(SESSIONS_ROOT, participant, tstr)
         os.makedirs(self.session_dir, exist_ok=True)
 
-        # Save a small config
-        with open(os.path.join(self.session_dir, "config.json"), "w") as fp:
+        # Save run config
+        with open(os.path.join(self.session_dir, "config.json"), "w", encoding="utf-8") as fp:
             json.dump({
                 "participant": participant,
                 "port": PORT,
@@ -390,17 +393,21 @@ class EMGExperiment(QtWidgets.QMainWindow):
         self.reader_thr = threading.Thread(target=serial_reader, args=(self.stop_event,), daemon=True)
         self.reader_thr.start()
 
-        # Reset counters and schedule first cue
+        # Reset meters & history
+        self.class_time_good.clear()
+        self.completed_trials.clear()
+        self._refresh_meters()
+
+        # Start state machine
         self.state = State.REST
         self.current_label = 0
         self._set_banner(State.REST)
-        self._log_event("SESSION_START", "—")
+        self._log_event("SESSION_START", "-")
         self._schedule_next_trial()
 
     def _on_pause(self):
         if self.state == State.PAUSED or self.state == State.IDLE:
             return
-        # Abort current trial if any
         self._abort_active_trial(reason="USER_PAUSE")
         self.state = State.PAUSED
         self.current_label = 0
@@ -411,7 +418,6 @@ class EMGExperiment(QtWidgets.QMainWindow):
     def _on_resume(self):
         if self.state != State.PAUSED:
             return
-        # Resume into REST → new trial
         self.state = State.REST
         self.current_label = 0
         self._set_banner(State.REST)
@@ -419,13 +425,12 @@ class EMGExperiment(QtWidgets.QMainWindow):
         self._schedule_next_trial()
 
     def _on_stop(self):
-        # Stop everything and close files
         self._abort_active_trial(reason="STOPPED")
         self.state = State.IDLE
         self.current_label = 0
         self._set_banner(State.IDLE)
         self.state_timer.stop()
-        self._log_event("SESSION_END", "—")
+        self._log_event("SESSION_END", "-")
         self.writers.close()
         try:
             self.stop_event.set()
@@ -433,29 +438,35 @@ class EMGExperiment(QtWidgets.QMainWindow):
             pass
         QtWidgets.QMessageBox.information(self, "Saved", f"Saved to:\n{self.session_dir}")
 
-    def _mark_issue(self, tag):
+    def _mark_issue_and_adjust(self, tag):
+        # Only while paused, like you requested
         if self.state != State.PAUSED:
             QtWidgets.QMessageBox.information(self, "Note", "Mark issues while paused.")
             return
+        # Find last *clean* completed trial and flip its status
+        for tr in reversed(self.completed_trials):
+            if tr.status == "ok":
+                tr.status = "failed" if tag == "FAILED" else "noisy"
+                dur = max(0.0, tr.t_end - tr.t_start)
+                if dur > 0:
+                    self.class_time_good[tr.label_id] = max(0.0, self.class_time_good.get(tr.label_id, 0.0) - dur)
+                    self._refresh_meters()
+                break
         self._log_event(tag, "user")
 
     # ---------- Scheduling ----------
     def _schedule_next_trial(self):
-        # If all targets hit, we can stop automatically (or keep cycling if you prefer)
         if self.scheduler.all_targets_reached(TARGET_REPS_PER_CLASS):
             QtWidgets.QMessageBox.information(self, "Done", "Target reps per class reached. Stopping.")
             self._on_stop()
             return
 
-        # Choose next label (1..8)
         next_label = self.scheduler.pick_next_label()
         self._update_media(next_label)
 
-        # Set preview for 3s
         self.state = State.READY
         self._set_banner(State.READY)
         self._log_event("GET_READY", LABELS[next_label])
-        # Build trial timings (absolute walltimes in *experiment clock* sense)
         now = time.time()
         do_duration = random.uniform(*MOVE_RANGE_SEC)
         self.active_trial = Trial(
@@ -464,25 +475,36 @@ class EMGExperiment(QtWidgets.QMainWindow):
             t_do_start=now + READY_LEAD_SEC,
             t_do_end=now + READY_LEAD_SEC + do_duration
         )
-        # Start 3s countdown to DO
         self.state_timer.start(int(READY_LEAD_SEC * 1000))
 
     def _advance_state(self):
-        # Called when READY->DO or DO->REST transitions elapse
         if self.state == State.READY and self.active_trial:
             # Begin DO
             self.state = State.DO
             self.current_label = self.active_trial.label_id
             self._set_banner(State.DO)
             self._log_event("MOVE_START", LABELS[self.current_label])
-            # schedule DO end
             remain = max(0.0, self.active_trial.t_do_end - time.time())
             self.state_timer.start(int(remain * 1000))
             return
 
         if self.state == State.DO and self.active_trial:
-            # End DO → REST with random rest duration
+            # End DO → REST
             self._log_event("MOVE_END", LABELS[self.active_trial.label_id])
+            # Count as a clean completed trial for now
+            tr = CompletedTrial(
+                label_id=self.active_trial.label_id,
+                t_start=self.active_trial.t_do_start,
+                t_end=time.time(),  # actual end
+                status="ok"
+            )
+            self.completed_trials.append(tr)
+            # Accumulate meters
+            dur = max(0.0, tr.t_end - tr.t_start)
+            if dur > 0:
+                self.class_time_good[tr.label_id] = self.class_time_good.get(tr.label_id, 0.0) + dur
+                self._refresh_meters()
+
             self.scheduler.mark_completed(self.active_trial.label_id)
             self.active_trial = None
             self.state = State.REST
@@ -490,14 +512,13 @@ class EMGExperiment(QtWidgets.QMainWindow):
             self._set_banner(State.REST)
             rest_dur = random.uniform(*REST_RANGE_SEC)
             self.state_timer.start(int(rest_dur * 1000))
-            # after REST, schedule next trial
             QtCore.QTimer.singleShot(int(rest_dur * 1000), self._schedule_next_trial)
 
     def _abort_active_trial(self, reason="ABORT"):
+        # If we were in READY or DO, abort without counting
         if self.active_trial:
             self._log_event("MOVE_ABORT", f"{LABELS[self.active_trial.label_id]}|{reason}")
             self.active_trial = None
-        # Also clear preview
         self._update_media(0)
         self.next_label.setText("Next: —")
 
@@ -506,12 +527,11 @@ class EMGExperiment(QtWidgets.QMainWindow):
         t_us = int(time.time() * 1e6)
         part = self.participant_edit.text().strip() or "-"
         try:
-            self.writers.events_csv.writerow([t_us, part, event, detail])
+            self.writers.events_csv.writerow([t_us, part, event, str(detail).replace('—','-')])
         except Exception:
             pass
 
     def _log_sample(self, t_us, stream_idx, vals):
-        # Per-sample row with current label & state
         part = self.participant_edit.text().strip() or "-"
         try:
             self.writers.samples_csv.writerow([
@@ -523,7 +543,7 @@ class EMGExperiment(QtWidgets.QMainWindow):
 
     # ---------- Main tick ----------
     def tick(self):
-        # 1) Drain serial queue → per-stream buffers
+        # Drain serial queue
         drained = 0
         while drained < 1000 and not q.empty():
             s, t_us, vals = q.get_nowait()
@@ -531,7 +551,7 @@ class EMGExperiment(QtWidgets.QMainWindow):
             self._log_sample(t_us, s, vals)
             drained += 1
 
-        # 2) Merge by round-robin
+        # Merge by round-robin
         merges = 0
         while merges < 1000:
             if any(len(raw_streams[s]) == 0 for s in range(N_STREAMS)):
@@ -547,7 +567,7 @@ class EMGExperiment(QtWidgets.QMainWindow):
             self.expected_s = (self.expected_s + 1) % N_STREAMS
             merges += 1
 
-        # 3) Update plots
+        # Update plots
         if self.tline:
             t_last = self.tline[-1]
             t_min = max(0.0, t_last - WINDOW_SEC)
@@ -558,14 +578,13 @@ class EMGExperiment(QtWidgets.QMainWindow):
                 self.plots[ch].setXRange(t_min, t_last)
                 self.plots[ch].setYRange(-128, 127)
 
-        # 4) Auto-pause if no new data
+        # Auto-pause on signal loss
         if self.state not in (State.IDLE, State.PAUSED):
             if time.time() - last_sample_walltime > NO_DATA_TIMEOUT:
-                # Only trigger once per outage
                 self._log_event("AUTOPAUSE_NO_DATA", f">{NO_DATA_TIMEOUT}s")
                 self._on_pause()
 
-        # 5) Update "Next:" countdown during READY
+        # READY countdown text
         if self.state == State.READY and self.active_trial:
             remain = max(0.0, self.active_trial.t_do_start - time.time())
             name = LABELS[self.active_trial.label_id].replace("_", " ").title()
@@ -576,7 +595,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     pg.setConfigOptions(antialias=True)
     win = EMGExperiment()
-    win.resize(1400, 800)
+    win.resize(1450, 860)
     win.show()
 
     def on_quit():
